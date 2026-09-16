@@ -30,6 +30,21 @@ const aclTensor *ConvertIntArrayToTensor(
     return tensor;
 }
 
+void SetTensorOriginalShape(const aclTensor *tensor)
+{
+    if (tensor != nullptr) {
+        tensor->SetOriginalShape(tensor->GetViewShape());
+    }
+}
+
+void NormalizeTensorDescriptors(
+    const std::initializer_list<const aclTensor *> &tensors)
+{
+    for (const aclTensor *tensor : tensors) {
+        SetTensorOriginalShape(tensor);
+    }
+}
+
 } // namespace
 
 extern "C" aclnnStatus aclnnChunkKdaBwdGetWorkspaceSize(
@@ -138,16 +153,28 @@ extern "C" aclnnStatus aclnnChunkKdaBwdGetWorkspaceSize(
                ACLNN_ERR_INNER_NULLPTR,
                "convert varlen metadata to tensors failed.");
 
-    // Keep the device ABI stable when optional outputs are absent.  The
-    // current CANN optional-output launcher does not materialize a nullptr
-    // placeholder reliably, which would shift workspace/tiling arguments.
-    // These aliases are never written unless the corresponding feature is
-    // enabled, in which case the public validation above requires real
-    // dA/dbias outputs.
+    // Keep the device ABI stable when optional outputs are absent.  Use
+    // distinct executor-owned placeholders: aliasing both slots to dgOut
+    // registers the same external tensor three times and corrupts executor
+    // cleanup in runtimes that track output ownership per slot.
+    const op::Shape placeholderShape({1});
     const aclTensor *dAForKernel =
-        dAOutOptional != nullptr ? dAOutOptional : dgOut;
+        dAOutOptional != nullptr
+            ? dAOutOptional
+            : executorPtr->AllocTensor(
+                  placeholderShape, dgOut->GetDataType(), Format::FORMAT_ND);
     const aclTensor *dBiasForKernel =
-        dBiasOutOptional != nullptr ? dBiasOutOptional : dgOut;
+        dBiasOutOptional != nullptr
+            ? dBiasOutOptional
+            : executorPtr->AllocTensor(
+                  placeholderShape, dgOut->GetDataType(), Format::FORMAT_ND);
+    CHECK_RET(dAForKernel != nullptr && dBiasForKernel != nullptr,
+              ACLNN_ERR_INNER_NULLPTR);
+    NormalizeTensorDescriptors({
+        q, k, v, beta, gk, aqk, akk, wOptional, qgOptional, kgOptional,
+        vNewOptional, hOptional, dO, rawGOptional, aLogOptional,
+        dtBiasOptional, cuTensor, chunkTensor, dqOut, dkOut, dvOut, dbOut,
+        dgOut, dAForKernel, dBiasForKernel});
     const auto result = l0op::ChunkKdaBwd(
         q, k, v, beta, gk, aqk, akk, wOptional, qgOptional, kgOptional,
         vNewOptional, hOptional, dO,
